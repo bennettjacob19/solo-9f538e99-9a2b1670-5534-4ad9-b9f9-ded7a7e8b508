@@ -50,6 +50,48 @@ class RestoreInProgress(ConflictError):
         super().__init__(message)
 
 
+class StaleEditError(ConflictError):
+    """The edit token a form carried is no longer the service's current token.
+
+    The token is opaque and is rotated on every change to the service (and on
+    a successful restore), so an old form conflicts even if the address has
+    since been changed back to the value the form was built from.
+    """
+
+    status_code = 409
+    code = "stale_edit"
+
+    def __init__(self, service: str, current: dict, message: str | None = None) -> None:
+        self.service = service
+        self.current = dict(current)
+        version = self.current.get("version")
+        if message is None:
+            if self.current.get("exists"):
+                message = (
+                    f"冲突：服务 {service} 已被其他操作修改，当前地址为 "
+                    f"{self.current.get('address')}（目录版本 {version}）。"
+                    "你的表单已过期，未保存任何更改。"
+                )
+            else:
+                message = (
+                    f"冲突：服务 {service} 已被删除（目录版本 {version}）。"
+                    "你的表单已过期，未做任何更改。"
+                )
+        if self.current.get("exists"):
+            details = [
+                f"当前地址：{self.current.get('address')}",
+                f"目录版本：{version}",
+            ]
+        else:
+            details = ["该服务当前不存在", f"目录版本：{version}"]
+        super().__init__(message, details=details)
+
+    def to_dict(self) -> dict:
+        payload = super().to_dict()
+        payload["current"] = self.current
+        return payload
+
+
 class BackupNameTaken(ConflictError):
     status_code = 409
     code = "backup_name_taken"

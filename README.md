@@ -41,16 +41,16 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 | GET | `/` | 网页：目录、修改表单、备份列表、恢复按钮 |
 | GET | `/resolve?name=<服务名>` | 返回单个服务的地址 |
 | GET | `/resolve` | 返回整个当前目录 |
-| GET | `/api/state` | 当前版本、完整目录、恢复状态、备份列表 |
+| GET | `/api/state` | 当前版本、完整目录（含每条服务的编辑令牌）、恢复状态、备份列表 |
 | GET | `/api/backups` | 备份列表 |
-| POST | `/api/services` | `{"service": ..., "address": ..., "note": ...}` 新增/修改 |
-| DELETE | `/api/services/<名>` | 删除 |
+| POST | `/api/services` | `{"service": ..., "address": ..., "note": ..., "token": ...}` 新增/修改；`token` 可选 |
+| DELETE | `/api/services/<名>` | 删除；`?token=...` 可选（也接受 JSON 体 `{"token": ...}`） |
 | POST | `/api/backups` | `{"name": ...}` 创建命名备份 |
 | GET | `/api/backups/<名>/validate` | 校验备份（不修改目录） |
 | POST | `/api/backups/<名>/restore` | 从备份恢复 |
 
-浏览器表单走 `POST /services`、`/backups`、`/backups/<名>/restore`，
-成功后 303 跳回页面并显示结果或错误。
+浏览器表单走 `POST /services`、`/services/<名>/delete`、`/backups`、
+`/backups/<名>/restore`，成功后 303 跳回页面并显示结果或错误。
 
 查询响应示例：
 
@@ -58,6 +58,8 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 {"ok": true, "version": 6, "restore_in_progress": false,
  "name": "orders-api", "address": "10.0.0.12:8080"}
 ```
+
+`/resolve` 永远只返回完整、已提交的目录版本，不含编辑令牌等内部状态。
 
 ## 一致性与恢复语义
 
@@ -86,6 +88,29 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 - **并发恢复。** 文件锁 + 数据库内的 `restore_state` 双重互斥，第二个恢复请求
   得到 409。
 
+## 编辑令牌（防止旧表单覆盖新地址）
+
+网页为每条已有服务各渲染一个「编辑」表单（行内修改地址）和删除按钮，两者都带
+一个隐藏的**编辑令牌**；保存与删除时都会校验。令牌是不透明字符串，不是版本号：
+
+- 令牌 = HMAC(数据库中持久化的随机密钥, 全局恢复纪元, 服务名, 该服务的代次)。
+  代次与纪元都在 SQLite 里，所以**重启不重置令牌**，读取和刷新页面也不会改变它。
+- 保存某服务只递增**该服务**的代次，所以其他服务的表单不受影响；令牌里还绑定了
+  服务名，令牌无法挪用到别的服务。
+- 服务被改动、删除、删除后重建，或从备份恢复（递增全局纪元，使所有服务的旧令牌
+  一次性失效）之后，旧表单都会得到 `409 stale_edit`，响应（JSON 的
+  `error.current`，网页的冲突提示）显示**当前已发布状态**，并且**不会产生新的
+  目录版本**。由于令牌与地址无关，即使地址又被改回表单里的原值，旧表单仍然冲突。
+- 令牌校验与发布新版本在**同一个写事务**里完成（`BEGIN IMMEDIATE`）：并发提交
+  同一份表单时只有一个成功，已受理的写入不会在校验之后被插队。
+- **旧的无令牌 API 仍可用。** `POST /api/services`（增或改）、
+  `DELETE /api/services/<名>` 不传 `token` 时照常工作（供脚本使用），但该写入会
+  递增对应服务的代次，因此会让该服务所有已打开的旧表单失效。
+- 网页底部不带令牌的表单只用于**新增**：若同名服务已存在，它会提示冲突而不是
+  覆盖，避免成为绕过令牌的入口（要修改请用目录行内的编辑表单）。
+- 校验失败的恢复（例如备份损坏）**不会**改动令牌，目录保持可写；恢复进行期间
+  仍按原有语义拒绝写入（`409 restore_in_progress`）。
+
 ## 测试
 
 ```bash
@@ -112,12 +137,31 @@ python3 -m pytest -q
 - `test_api_flow` / `test_html_page_and_forms` / `test_html_escapes_hostile_names`
 - `test_api_validation_errors_are_json` / `test_edge_case_inputs_are_rejected_cleanly`
 
+编辑令牌相关：
+
+- `test_stale_form_cannot_overwrite_newer_edit`（后提交的旧表单被拒、无新版本）
+- `test_stale_form_conflicts_even_if_address_reverted`（地址改回原值仍冲突）
+- `test_delete_then_recreate_invalidates_old_form`
+- `test_restore_invalidates_all_old_forms_even_if_same_values`
+- `test_failed_restore_does_not_invalidate_tokens`
+- `test_other_services_edit_does_not_invalidate_token`
+- `test_token_survives_restart` / `test_token_survives_restart_through_http`
+- `test_token_check_and_publish_are_atomic`（并发提交只有一个成功）
+- `test_legacy_tokenless_api_still_works_and_invalidates_forms`
+- `test_html_add_form_refuses_to_overwrite_existing_service` /
+  `test_legacy_api_is_not_affected_by_add_form_restriction`
+- `test_html_conflict_shows_current_state_and_creates_no_version` /
+  `test_html_conflict_after_restore_renders_current_state` /
+  `test_html_stale_delete_conflict`
+- `test_legacy_database_without_token_schema_is_migrated`
+- `test_token_does_not_leak_into_resolve`
+
 ## 布局
 
 ```
 svcdir/errors.py     错误类型 → HTTP 状态码
 svcdir/store.py      目录版本、命名备份、校验、恢复（核心逻辑）
-svcdir/web.py        Flask 路由：网页 + API
+svcdir/web.py        Flask 路由：网页 + API（编辑令牌校验、冲突展示）
 svcdir/templates/    页面模板
 tests/test_svcdir.py 自测（含并发交错）
 Dockerfile / docker-compose.yml
@@ -126,8 +170,9 @@ Dockerfile / docker-compose.yml
 ## 已知限制与未完成项
 
 - **未在 Docker 中实际构建/运行。** 本环境没有 Docker（`docker` 命令不存在），
-  因此 Dockerfile 与 compose 文件只做了静态检查。应用本身已用
-  `python -m svcdir` 与 gunicorn 在真实 HTTP 上跑通。
+  因此 Dockerfile 与 compose 文件只做了静态检查（compose YAML 已解析校验）。
+  应用本身已用 gunicorn 在真实 HTTP 上跑通。`docker compose up --build` 即可
+  按上方说明启动，数据落在命名卷 `svcdir-data`。
 - 单容器部署，恢复互斥依赖同一文件系统上的 `flock`；若把数据目录放到不支持
   `flock` 的网络文件系统，会退化为「租约到期才算失效」。
 - 备份保存在同一 SQLite 数据库中，可防止误改目录，但不能防磁盘/文件损坏；

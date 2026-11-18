@@ -14,6 +14,7 @@ from svcdir.errors import (
     ConflictError,
     NotFoundError,
     RestoreInProgress,
+    StaleEditError,
 )
 
 
@@ -781,3 +782,381 @@ def test_html_escapes_hostile_names(client):
     resp = client.get("/")
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
     assert "script-src 'self'" in resp.headers["Content-Security-Policy"]
+
+
+# ---------------------------------------------------------------------------
+# Edit tokens (lost-update protection)
+
+
+def make_app(tmp_path, name="tok.sqlite3"):
+    app = create_app(DirectoryStore(tmp_path / name))
+    app.config.update(TESTING=True)
+    return app, app.test_client()
+
+
+def open_edit_form(client, service):
+    """Extract the per-service edit form as a browser would have rendered it."""
+    import re as _re
+
+    page = client.get("/").get_data(as_text=True)
+    block = _re.search(
+        r'action="/services"[^>]*>.*?name="service" value="([^"]*)".*?'
+        r'name="token" value="([^"]*)".*?name="address" value="([^"]*)"',
+        page,
+        _re.S,
+    )
+    assert block and block.group(1) == service, page
+    return {"service": block.group(1), "token": block.group(2), "address": block.group(3)}
+
+
+def test_token_present_in_page_and_state(store):
+    seed(store, {"a": "1", "b": "2"})
+    snapshot = store.snapshot()
+    tokens = {row["service"]: row["token"] for row in snapshot["services"]}
+    assert set(tokens) == {"a", "b"}
+    assert all(tokens.values())
+    # Stable while nothing changes; different per service.
+    assert store.snapshot()["services"] == snapshot["services"]
+    assert tokens["a"] != tokens["b"]
+    assert store.resolve("a")["token"] == tokens["a"]
+
+
+def test_stale_form_cannot_overwrite_newer_edit(store):
+    store.upsert("orders", "10.0.0.1:80")
+    token_a = store.resolve("orders")["token"]
+    store.upsert("orders", "10.0.0.2:80")  # someone else saved first
+    version_before = store.resolve()["version"]
+
+    with pytest.raises(StaleEditError) as excinfo:
+        store.upsert("orders", "10.0.0.9:80", token=token_a)
+    assert excinfo.value.current["address"] == "10.0.0.2:80"
+    assert excinfo.value.current["exists"] is True
+    after = store.resolve("orders")
+    assert after["address"] == "10.0.0.2:80"
+    assert after["version"] == version_before  # no new version was published
+
+
+def test_stale_form_conflicts_even_if_address_reverted(store):
+    store.upsert("orders", "old")
+    token_old = store.resolve("orders")["token"]
+    store.upsert("orders", "middle")
+    store.upsert("orders", "old")  # address is back to the original value
+    with pytest.raises(StaleEditError) as excinfo:
+        store.upsert("orders", "form-value", token=token_old)
+    assert excinfo.value.current["address"] == "old"
+    assert store.resolve("orders")["address"] == "old"
+
+
+def test_stale_delete_conflicts_and_does_not_delete(store):
+    store.upsert("orders", "a")
+    token_old = store.resolve("orders")["token"]
+    store.upsert("orders", "b")
+    with pytest.raises(StaleEditError):
+        store.delete("orders", token=token_old)
+    assert store.resolve("orders")["address"] == "b"
+    # The fresh token works.
+    store.delete("orders", token=store.resolve("orders")["token"])
+    with pytest.raises(NotFoundError):
+        store.resolve("orders")
+
+
+def test_delete_then_recreate_invalidates_old_form(store):
+    store.upsert("orders", "addr")
+    token_before_delete = store.resolve("orders")["token"]
+    store.delete("orders")
+    store.upsert("orders", "addr")  # same address as the old form had
+    with pytest.raises(StaleEditError) as excinfo:
+        store.upsert("orders", "other", token=token_before_delete)
+    assert excinfo.value.current["address"] == "addr"
+    with pytest.raises(StaleEditError):
+        store.delete("orders", token=token_before_delete)
+    assert store.resolve("orders")["address"] == "addr"
+
+
+def test_token_for_deleted_service_is_stale_and_reports_missing(store):
+    store.upsert("orders", "addr")
+    token = store.resolve("orders")["token"]
+    store.delete("orders")
+    with pytest.raises(StaleEditError) as excinfo:
+        store.upsert("orders", "addr", token=token)
+    assert excinfo.value.current["exists"] is False
+    assert excinfo.value.current["address"] is None
+    with pytest.raises(NotFoundError):
+        store.resolve("orders")
+
+
+def test_other_services_edit_does_not_invalidate_token(store):
+    seed(store, {"a": "1", "b": "2"})
+    token_a = store.resolve("a")["token"]
+    store.upsert("b", "changed")
+    store.upsert("b", "changed-again")
+    store.upsert("a", "1b", token=token_a)  # still accepted
+    assert store.resolve("a")["address"] == "1b"
+
+
+def test_token_survives_restart(tmp_path):
+    db = tmp_path / "restart.sqlite3"
+    first = DirectoryStore(db)
+    first.upsert("a", "1")
+    token = first.resolve("a")["token"]
+
+    second = DirectoryStore(db)
+    second.initialize()
+    assert second.resolve("a")["token"] == token
+    assert second.upsert("a", "2", token=token)["address"] == "2"
+
+
+def test_restore_invalidates_all_old_forms_even_if_same_values(store):
+    seed(store, {"a": "old", "b": "keep"})
+    store.create_backup("snap")
+    token_a = store.resolve("a")["token"]
+    token_b = store.resolve("b")["token"]
+    store.upsert("a", "live")
+    store.upsert("b", "live")
+    store.upsert("a", "old")  # a happens to be back to the backup value
+    store.upsert("b", "keep")
+
+    store.restore_backup("snap")
+
+    for svc, tok in (("a", token_a), ("b", token_b)):
+        with pytest.raises(StaleEditError) as excinfo:
+            store.upsert(svc, "from-old-form", token=tok)
+        assert excinfo.value.current["exists"] is True
+    assert store.resolve()["services"] == {"a": "old", "b": "keep"}
+    # Newly issued tokens are usable again.
+    store.upsert("a", "post-restore", token=store.resolve("a")["token"])
+    assert store.resolve("a")["address"] == "post-restore"
+
+
+def test_failed_restore_does_not_invalidate_tokens(store):
+    seed(store, {"a": "1"})
+    store.create_backup("snap")
+    token = store.resolve("a")["token"]
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE entries SET address='tampered' WHERE service='a' "
+            "AND version_id=(SELECT version_id FROM backups WHERE name='snap')"
+        )
+    with pytest.raises(BackupValidationError):
+        store.restore_backup("snap")
+    # Restore failed: the form is still current and can be saved.
+    assert store.resolve("a")["token"] == token
+    store.upsert("a", "2", token=token)
+    assert store.resolve("a")["address"] == "2"
+    # The failed restore also did not leave the directory read-only.
+    store.upsert("b", "3")
+    assert store.resolve("b")["address"] == "3"
+
+
+def test_token_check_and_publish_are_atomic(store):
+    """Concurrent saves from the same form: exactly one wins."""
+    store.upsert("orders", "v0")
+    token = store.resolve("orders")["token"]
+    outcomes: list[str] = []
+    barrier = threading.Barrier(6)
+
+    def writer(i):
+        barrier.wait()
+        try:
+            store.upsert("orders", f"w{i}", token=token)
+            outcomes.append(f"ok-{i}")
+        except StaleEditError:
+            outcomes.append(f"stale-{i}")
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(20)
+    assert len(outcomes) == 6
+    winners = [o for o in outcomes if o.startswith("ok-")]
+    assert len(winners) == 1, outcomes
+    assert store.resolve("orders")["address"] == f"w{winners[0].split('-')[1]}"
+
+
+def test_json_api_stale_token_is_409_with_current_state(tmp_path):
+    _app, client = make_app(tmp_path)
+    created = client.post(
+        "/api/services", json={"service": "a", "address": "1"}
+    ).get_json()
+    token = created["token"]
+    client.post("/api/services", json={"service": "a", "address": "2"})
+    resp = client.post(
+        "/api/services", json={"service": "a", "address": "3", "token": token}
+    )
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert body["error"]["code"] == "stale_edit"
+    assert body["error"]["current"]["address"] == "2"
+    assert body["error"]["current"]["exists"] is True
+    assert client.get("/resolve?name=a").get_json()["address"] == "2"
+
+
+def test_json_api_delete_accepts_optional_token(tmp_path):
+    _app, client = make_app(tmp_path)
+    token = client.post(
+        "/api/services", json={"service": "a", "address": "1"}
+    ).get_json()["token"]
+    client.post("/api/services", json={"service": "a", "address": "2"})
+    assert client.delete(f"/api/services/a?token={token}").status_code == 409
+    fresh = client.get("/api/state").get_json()["services"][0]["token"]
+    assert client.delete(f"/api/services/a?token={fresh}").status_code == 200
+    assert client.get("/resolve?name=a").status_code == 404
+
+
+def test_legacy_tokenless_api_still_works_and_invalidates_forms(tmp_path):
+    _app, client = make_app(tmp_path)
+    assert client.post(
+        "/api/services", json={"service": "a", "address": "1"}
+    ).status_code == 200
+    token = client.get("/api/state").get_json()["services"][0]["token"]
+    # Legacy call without a token: accepted, but rotates the token.
+    assert client.post(
+        "/api/services", json={"service": "a", "address": "2"}
+    ).status_code == 200
+    stale = client.post(
+        "/api/services", json={"service": "a", "address": "3", "token": token}
+    )
+    assert stale.status_code == 409
+    # Legacy delete without a token still works and invalidates forms.
+    fresh = client.get("/api/state").get_json()["services"][0]["token"]
+    assert client.delete("/api/services/a").status_code == 200
+    assert client.post(
+        "/api/services", json={"service": "a", "address": "2", "token": fresh}
+    ).status_code == 409
+    assert client.get("/resolve?name=a").status_code == 404
+
+
+def test_html_conflict_shows_current_state_and_creates_no_version(tmp_path):
+    app, client = make_app(tmp_path)
+    client.post("/api/services", json={"service": "orders", "address": "10.0.0.1:80"})
+    form = open_edit_form(client, "orders")
+    # Another operator saves first (API without a token is still supported).
+    client.post("/api/services", json={"service": "orders", "address": "10.0.0.2:80"})
+    version_before = client.get("/api/state").get_json()["version"]
+
+    resp = client.post("/services", data={**form, "address": "10.0.0.9:80"})
+    assert resp.status_code == 409
+    page = resp.get_data(as_text=True)
+    assert "冲突" in page
+    assert "10.0.0.2:80" in page  # current published address is shown
+    state = client.get("/api/state").get_json()
+    assert state["version"] == version_before
+    assert state["services"] == [
+        {"service": "orders", "address": "10.0.0.2:80",
+         "token": state["services"][0]["token"]}
+    ]
+    assert client.get("/resolve?name=orders").get_json()["address"] == "10.0.0.2:80"
+
+
+def test_html_conflict_after_restore_renders_current_state(tmp_path):
+    _app, client = make_app(tmp_path)
+    client.post("/api/services", json={"service": "orders", "address": "old"})
+    form = open_edit_form(client, "orders")
+    client.post("/backups", data={"name": "snap"})
+    client.post("/api/services", json={"service": "orders", "address": "live"})
+    client.post("/backups/snap/restore")
+
+    resp = client.post("/services", data={**form, "address": "form-address"})
+    assert resp.status_code == 409
+    page = resp.get_data(as_text=True)
+    assert "冲突" in page
+    assert client.get("/resolve?name=orders").get_json()["address"] == "old"
+
+
+def test_html_stale_delete_conflict(tmp_path):
+    _app, client = make_app(tmp_path)
+    client.post("/services", data={"service": "orders", "address": "1"})
+    client.post("/services", data={"service": "other", "address": "x"})
+    page = client.get("/").get_data(as_text=True)
+    import re as _re
+
+    match = _re.search(
+        r'action="/services/orders/delete".*?name="token" value="([^"]*)"', page, _re.S
+    )
+    assert match
+    stale_token = match.group(1)
+    client.post("/api/services", json={"service": "orders", "address": "2"})
+    resp = client.post(
+        "/services/orders/delete", data={"token": stale_token}
+    )
+    assert resp.status_code == 409
+    assert client.get("/resolve?name=orders").get_json()["address"] == "2"
+
+
+def test_token_survives_restart_through_http(tmp_path):
+    app, client = make_app(tmp_path, "restart-http.sqlite3")
+    client.post("/services", data={"service": "a", "address": "1"})
+    form = open_edit_form(client, "a")
+
+    app2, client2 = make_app(tmp_path, "restart-http.sqlite3")
+    resp = client2.post("/services", data=form)
+    assert resp.status_code == 303  # token from before the restart is valid
+    assert client2.get("/resolve?name=a").get_json()["address"] == "1"
+
+
+def test_legacy_database_without_token_schema_is_migrated(tmp_path):
+    db = tmp_path / "legacy.sqlite3"
+    store = DirectoryStore(db)
+    store.upsert("a", "1")
+    store.initialize()
+    # Emulate a pre-token database: drop the token bookkeeping.
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TABLE service_generations")
+        conn.execute("DELETE FROM meta WHERE key IN ('edit_secret', 'edit_epoch')")
+    reopened = DirectoryStore(db)
+    reopened.initialize()
+    token = reopened.resolve("a")["token"]
+    assert token
+    reopened.upsert("a", "2", token=token)
+    assert reopened.resolve("a")["address"] == "2"
+
+
+def test_token_does_not_leak_into_resolve(tmp_path):
+    _app, client = make_app(tmp_path)
+    client.post("/api/services", json={"service": "a", "address": "1"})
+    body = client.get("/resolve").get_json()
+    assert body["services"] == {"a": "1"}
+    single = client.get("/resolve?name=a").get_json()
+    assert "token" not in single
+
+
+def test_html_add_form_refuses_to_overwrite_existing_service(tmp_path):
+    """The tokenless add form must not become a way around the edit token."""
+    _app, client = make_app(tmp_path)
+    client.post("/api/services", json={"service": "orders", "address": "1"})
+    token = client.get("/api/state").get_json()["services"][0]["token"]
+    version_before = client.get("/api/state").get_json()["version"]
+
+    resp = client.post("/services", data={"service": "orders", "address": "2"})
+    assert resp.status_code == 409
+    page = resp.get_data(as_text=True)
+    assert "已存在" in page
+    state = client.get("/api/state").get_json()
+    assert state["version"] == version_before
+    assert state["services"][0]["address"] == "1"
+    # The still-open form keeps working.
+    client.post("/services", data={"service": "orders", "address": "3", "token": token})
+    assert client.get("/resolve?name=orders").get_json()["address"] == "3"
+
+
+def test_legacy_api_is_not_affected_by_add_form_restriction(store):
+    """Scripts using the tokenless JSON API can still update and delete."""
+    store.upsert("orders", "1", require_new=True)
+    with pytest.raises(StaleEditError):
+        store.upsert("orders", "2", require_new=True)
+    store.upsert("orders", "2")  # legacy update
+    assert store.resolve("orders")["address"] == "2"
+
+
+def test_other_service_edit_leaves_open_form_usable_over_http(tmp_path):
+    _app, client = make_app(tmp_path)
+    client.post("/api/services", json={"service": "a", "address": "1"})
+    client.post("/api/services", json={"service": "b", "address": "2"})
+    form = open_edit_form(client, "a")
+    # Someone else edits only b (via API and via the HTML row form for b).
+    client.post("/api/services", json={"service": "b", "address": "3"})
+    resp = client.post("/services", data={**form, "address": "1'"})
+    assert resp.status_code == 303
+    assert client.get("/resolve?name=a").get_json()["address"] == "1'"
+    assert client.get("/resolve?name=b").get_json()["address"] == "3"

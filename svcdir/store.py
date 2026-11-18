@@ -10,6 +10,14 @@ Design summary
   after a restore.  Old versions and their rows are never deleted.
 * A named backup pins the current version id at a single commit point, so it is
   always a complete directory even while writes keep arriving.
+* Every service carries an opaque edit token.  It is an HMAC over a persisted
+  random secret, a global *restore epoch* and a per-service *generation*; the
+  epoch and the generation live in the database.  Changing a service bumps only
+  its own generation; a successful restore bumps the epoch.  Tokens are thus
+  stable across restarts and reads, unaffected by edits to other services, and
+  invalid after the service was changed, deleted/recreated or restored -- even
+  if the address has since been changed back to the old value.  A write compares
+  the presented token and publishes the new version in *one* transaction.
 * A restore is: mark a lease -> validate the backup -> atomically create a new
   version copied from the backup and switch ``current_version``.  The switch is
   one transaction: after a crash/restart the directory is either the original
@@ -48,14 +56,17 @@ from .errors import (
     InputError,
     NotFoundError,
     RestoreInProgress,
+    StaleEditError,
 )
 
 SCHEMA_VERSION = 1
 BACKUP_FORMAT = "svcdir-backup-v1"
+TOKEN_FORMAT = "svcdir-edit-token-v1"
 MAX_SERVICES = 5000
 MAX_ADDRESS_LENGTH = 512
 MAX_BACKUP_NAME_LENGTH = 64
 MAX_NOTE_LENGTH = 200
+MAX_TOKEN_LENGTH = 512
 
 SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -117,6 +128,18 @@ def _clean_note(raw: Any) -> str:
     if not isinstance(raw, str):
         return ""
     return raw.strip()[:MAX_NOTE_LENGTH]
+
+
+def _clean_token(raw: Any) -> str | None:
+    """Normalise an edit token; an absent or empty token means "legacy call"."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise InputError("编辑令牌必须是字符串")
+    token = raw.strip()
+    if len(token) > MAX_TOKEN_LENGTH:
+        raise InputError("编辑令牌过长")
+    return token or None
 
 
 def _utc_now_iso() -> str:
@@ -188,6 +211,7 @@ class _PinnedView:
             "version": self.version,
             "name": service,
             "address": str(row["address"]),
+            "token": self._store._issue_token(self._conn, service),
             "restore_in_progress": self.restore_in_progress,
             "restore": self.restore,
         }
@@ -300,6 +324,7 @@ class DirectoryStore:
                     f"数据库 schema 版本不兼容：期望 {SCHEMA_VERSION}，实际 "
                     f"{None if row is None else row['value']}"
                 )
+            self._ensure_edit_schema(conn)
             return
         conn.execute(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -347,6 +372,27 @@ class DirectoryStore:
         self._meta_set(conn, "schema_version", str(SCHEMA_VERSION))
         self._meta_set(conn, "current_version", str(initial_version))
         self._meta_set(conn, "restore_state", "idle")
+        self._ensure_edit_schema(conn)
+
+    def _ensure_edit_schema(self, conn: sqlite3.Connection) -> None:
+        """Additive, idempotent migration for edit tokens.
+
+        Older databases (schema 1) simply gain the extra table and meta rows;
+        existing tokens do not exist yet, so every service starts at
+        generation 0 and gets a valid token immediately.
+        """
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS service_generations (
+                service TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL
+            )
+            """
+        )
+        if self._meta_get(conn, "edit_secret") is None:
+            self._meta_set(conn, "edit_secret", secrets.token_hex(32))
+        if self._meta_get(conn, "edit_epoch") is None:
+            self._meta_set(conn, "edit_epoch", "0")
 
     # -- meta helpers -----------------------------------------------------
 
@@ -514,6 +560,129 @@ class DirectoryStore:
         ).fetchall()
         return tuple((str(r["service"]), str(r["address"])) for r in rows)
 
+    # -- edit tokens ------------------------------------------------------
+
+    def _edit_material(self, conn: sqlite3.Connection) -> tuple[bytes, int]:
+        secret = self._meta_get(conn, "edit_secret")
+        if not secret:
+            raise ConflictError(
+                "目录状态损坏：缺少编辑令牌密钥", code="corrupt_state"
+            )
+        try:
+            epoch = int(self._meta_get(conn, "edit_epoch", "0") or 0)
+        except ValueError:
+            raise ConflictError(
+                "目录状态损坏：编辑令牌纪元无效", code="corrupt_state"
+            )
+        return secret.encode("utf-8"), epoch
+
+    @staticmethod
+    def _generation(conn: sqlite3.Connection, service: str) -> int:
+        row = conn.execute(
+            "SELECT generation FROM service_generations WHERE service=?",
+            (service,),
+        ).fetchone()
+        return 0 if row is None else int(row["generation"])
+
+    @staticmethod
+    def _bump_generation(conn: sqlite3.Connection, service: str) -> int:
+        """Invalidate every token issued for this service and only this one."""
+        row = conn.execute(
+            "SELECT generation FROM service_generations WHERE service=?",
+            (service,),
+        ).fetchone()
+        generation = (0 if row is None else int(row["generation"])) + 1
+        conn.execute(
+            "INSERT INTO service_generations(service, generation) VALUES (?, ?) "
+            "ON CONFLICT(service) DO UPDATE SET generation=excluded.generation",
+            (service, generation),
+        )
+        return generation
+
+    @staticmethod
+    def _token_digest(
+        secret: bytes, epoch: int, service: str, generation: int
+    ) -> bytes:
+        payload = json.dumps(
+            {
+                "format": TOKEN_FORMAT,
+                "epoch": epoch,
+                "service": service,
+                "generation": generation,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).digest()
+
+    def _issue_token(
+        self,
+        conn: sqlite3.Connection,
+        service: str,
+        *,
+        material: tuple[bytes, int] | None = None,
+    ) -> str:
+        secret, epoch = material if material is not None else self._edit_material(conn)
+        generation = self._generation(conn, service)
+        digest = self._token_digest(secret, epoch, service, generation)
+        return digest.hex()
+
+    def _issue_tokens(
+        self, conn: sqlite3.Connection, services: list[str]
+    ) -> dict[str, str]:
+        """Batch form of :meth:`_issue_token` (one generation query total)."""
+        if not services:
+            return {}
+        secret, epoch = self._edit_material(conn)
+        generations = {
+            str(row["service"]): int(row["generation"])
+            for row in conn.execute(
+                "SELECT service, generation FROM service_generations"
+            ).fetchall()
+        }
+        return {
+            service: self._token_digest(
+                secret, epoch, service, generations.get(service, 0)
+            ).hex()
+            for service in services
+        }
+
+    def _service_state(self, conn: sqlite3.Connection, service: str) -> dict:
+        """Current published state of one service, including its edit token."""
+        version = self._current_version(conn)
+        row = conn.execute(
+            "SELECT address FROM entries WHERE version_id=? AND service=?",
+            (version, service),
+        ).fetchone()
+        state: dict[str, Any] = {
+            "version": version,
+            "exists": row is not None,
+            "address": None if row is None else str(row["address"]),
+            "token": self._issue_token(conn, service),
+        }
+        return state
+
+    def _check_edit_token(
+        self,
+        conn: sqlite3.Connection,
+        service: str,
+        token: str | None,
+    ) -> None:
+        """Reject a stale edit form.  Caller already holds the write txn."""
+        current = self._service_state(conn, service)
+        if token is None:
+            # Legacy caller (no token): still allowed, but it invalidates any
+            # form that was open, via the generation bump in the write path.
+            return
+        if not current["exists"]:
+            raise StaleEditError(service, current)
+        expected = current["token"]
+        if not hmac.compare_digest(
+            token.encode("utf-8"), expected.encode("utf-8")
+        ):
+            raise StaleEditError(service, current)
+
     def _fire(self, name: str, payload: dict) -> None:
         hook = self._hooks.get(name)
         if hook is not None:
@@ -551,6 +720,7 @@ class DirectoryStore:
             version = self._current_version(conn)
             rows = self._entries(conn, version)
             restore = self._restore_summary(conn)
+            tokens = self._issue_tokens(conn, [service for service, _ in rows])
             backups = [
                 {
                     "name": str(r["name"]),
@@ -568,7 +738,7 @@ class DirectoryStore:
             "version": version,
             "count": len(rows),
             "services": [
-                {"service": s, "address": a} for s, a in rows
+                {"service": s, "address": a, "token": tokens[s]} for s, a in rows
             ],
             "restore": restore,
             "backups": backups,
@@ -592,18 +762,42 @@ class DirectoryStore:
 
     # -- writes -----------------------------------------------------------
 
-    def upsert(self, service: Any, address: Any, note: Any = "") -> dict:
+    def upsert(
+        self,
+        service: Any,
+        address: Any,
+        note: Any = "",
+        *,
+        token: Any = None,
+        require_new: bool = False,
+    ) -> dict:
         svc = validate_service_name(service)
         addr = validate_address(address)
         clean_note = _clean_note(note)
+        expected = _clean_token(token)
         self._ensure_ready()
         with self._txn(write=True) as conn:
             self._require_writable(conn)
+            # Validation and publication are in this one write transaction, so
+            # no write can land between "token is current" and the new version.
+            self._check_edit_token(conn, svc, expected)
             previous = self._current_version(conn)
             exists = conn.execute(
                 "SELECT 1 FROM entries WHERE version_id=? AND service=?",
                 (previous, svc),
             ).fetchone()
+            if require_new and exists:
+                # The browser's add form carries no token.  Letting it update an
+                # existing service would be an untokened path around the edit
+                # protection, so it only ever creates new services.
+                raise StaleEditError(
+                    svc,
+                    self._service_state(conn, svc),
+                    message=(
+                        f"服务 {svc} 已存在，未做任何更改。"
+                        "请使用该服务行内的编辑表单保存修改。"
+                    ),
+                )
             if not exists and conn.execute(
                 "SELECT COUNT(*) AS n FROM entries WHERE version_id=?", (previous,)
             ).fetchone()["n"] >= MAX_SERVICES:
@@ -617,18 +811,24 @@ class DirectoryStore:
                 (new_version, svc, addr),
             )
             self._set_current(conn, new_version)
+            # Only this service's forms go stale.
+            self._bump_generation(conn, svc)
+            new_token = self._issue_token(conn, svc)
         return {
             "version": new_version,
             "previous_version": previous,
             "service": svc,
             "address": addr,
+            "token": new_token,
         }
 
-    def delete(self, service: Any) -> dict:
+    def delete(self, service: Any, *, token: Any = None) -> dict:
         svc = validate_service_name(service)
+        expected = _clean_token(token)
         self._ensure_ready()
         with self._txn(write=True) as conn:
             self._require_writable(conn)
+            self._check_edit_token(conn, svc, expected)
             previous = self._current_version(conn)
             new_version = self._create_version(
                 conn, previous, "update", f"删除 {svc}"
@@ -640,11 +840,16 @@ class DirectoryStore:
             if cur.rowcount == 0:
                 raise NotFoundError(f"未知服务: {svc}")
             self._set_current(conn, new_version)
+            # Keep the generation so that a later re-create starts from a new
+            # generation (and any form from before the delete stays invalid).
+            self._bump_generation(conn, svc)
         return {
             "version": new_version,
             "previous_version": previous,
             "service": svc,
             "deleted": True,
+            # The service no longer exists; re-creating it issues a fresh token.
+            "token": None,
         }
 
     def create_backup(self, name: Any) -> dict:
@@ -852,6 +1057,12 @@ class DirectoryStore:
                     conn, validated.version_id, "restore", f"恢复备份 {backup_name}"
                 )
                 self._set_current(conn, new_version)
+                # A restore invalidates every edit token issued before it, so
+                # forms built from the pre-restore directory cannot overwrite
+                # the restored state.
+                material = self._edit_material(conn)
+                epoch = int(material[1]) + 1
+                self._meta_set(conn, "edit_epoch", str(epoch))
                 self._clear_restore(conn)
 
             result = {

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 
-from .errors import DirectoryError, InputError
+from .errors import DirectoryError, InputError, StaleEditError
 from .store import DirectoryStore
 
 
@@ -136,13 +136,21 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
         if not isinstance(payload, dict):
             raise InputError("请求体必须是 JSON 对象")
         result = store.upsert(
-            payload.get("service"), payload.get("address"), payload.get("note", "")
+            payload.get("service"),
+            payload.get("address"),
+            payload.get("note", ""),
+            token=payload.get("token"),
         )
         return jsonify({"ok": True, **result}), 200
 
     @app.delete("/api/services/<path:service>")
     def api_delete(service: str):
-        return jsonify({"ok": True, **store.delete(service)})
+        token = request.args.get("token")
+        if token is None:
+            payload = request.get_json(silent=True)
+            if isinstance(payload, dict):
+                token = payload.get("token")
+        return jsonify({"ok": True, **store.delete(service, token=token)})
 
     @app.post("/api/backups")
     def api_create_backup():
@@ -166,17 +174,43 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     def _redirect_back(**kwargs):
         return redirect(url_for("index", **kwargs), code=303)
 
+    def _render_index(status: int = 200, **kwargs):
+        snapshot = store.snapshot()
+        return (
+            render_template(
+                "index.html",
+                state=snapshot,
+                message=kwargs.get("message"),
+                error=kwargs.get("error"),
+                conflict=kwargs.get("conflict"),
+            ),
+            status,
+        )
+
     @app.get("/")
     def index():
-        snapshot = store.snapshot()
-        return render_template("index.html", state=snapshot, message=request.args.get("message"),
-                               error=request.args.get("error"))
+        return _render_index(
+            message=request.args.get("message"), error=request.args.get("error")
+        )
 
     @app.post("/services")
     def form_upsert():
+        service = request.form.get("service")
+        token = request.form.get("token")
         try:
             result = store.upsert(
-                request.form.get("service"), request.form.get("address"), request.form.get("note", "")
+                service,
+                request.form.get("address"),
+                request.form.get("note", ""),
+                token=token,
+                require_new=not token,
+            )
+        except StaleEditError as exc:
+            # Show the conflict *and* the current published state right away;
+            # no new directory version was created.
+            return _render_index(
+                status=exc.status_code,
+                conflict=exc.to_dict(),
             )
         except DirectoryError as exc:
             return _redirect_back(error=exc.message)
@@ -187,7 +221,12 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     @app.post("/services/<path:service>/delete")
     def form_delete(service: str):
         try:
-            result = store.delete(service)
+            result = store.delete(service, token=request.form.get("token"))
+        except StaleEditError as exc:
+            return _render_index(
+                status=exc.status_code,
+                conflict=exc.to_dict(),
+            )
         except DirectoryError as exc:
             return _redirect_back(error=exc.message)
         return _redirect_back(message=f"已删除 {result['service']}（目录版本 {result['version']}）")

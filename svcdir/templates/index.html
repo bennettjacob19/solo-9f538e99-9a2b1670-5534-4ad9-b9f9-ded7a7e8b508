@@ -15,7 +15,21 @@
 
 <main>
   {% if message %}<div class="flash ok" role="status">{{ message }}</div>{% endif %}
-  {% if error %}<div class="flash bad" role="alert">{{ error }}</div>{% endif %}
+  {% if error and not conflict %}<div class="flash bad" role="alert">{{ error }}</div>{% endif %}
+  {% if conflict %}
+  <div class="flash bad" role="alert" id="conflict">
+    <strong>冲突未保存。</strong>{{ conflict.message }}
+    没有产生新的目录版本。
+    {% if conflict.current.exists %}
+    当前 <span class="mono">{{ conflict.service }}</span> 的已发布地址为
+    <span class="mono">{{ conflict.current.address }}</span>
+    （目录版本 {{ conflict.current.version }}）。
+    {% else %}
+    当前 <span class="mono">{{ conflict.service }}</span> 已被删除，
+    请重新确认后再操作（目录版本 {{ conflict.current.version }}）。
+    {% endif %}
+  </div>
+  {% endif %}
 
   {% if state.restore.state == 'restoring' %}
   <div class="flash warn" role="alert">
@@ -28,15 +42,27 @@
     <h2>当前目录 <span class="badge">版本 {{ state.version }} · {{ state.count }} 项</span></h2>
     {% if state.services %}
     <table>
-      <thead><tr><th>服务名</th><th>目标地址</th><th></th></tr></thead>
+      <thead><tr><th>服务名</th><th>目标地址</th><th>编辑</th><th></th></tr></thead>
       <tbody>
       {% for row in state.services %}
         <tr>
           <td class="mono">{{ row.service }}</td>
           <td class="mono">{{ row.address }}</td>
+          <td>
+            <form method="post" action="{{ url_for('form_upsert') }}" class="edit-row">
+              <input type="hidden" name="service" value="{{ row.service }}">
+              <input type="hidden" name="token" value="{{ row.token }}">
+              <input name="address" value="{{ row.address }}" required
+                     maxlength="512" aria-label="新的目标地址">
+              <input name="note" maxlength="200" placeholder="备注（可选）"
+                     aria-label="备注">
+              <button type="submit">保存</button>
+            </form>
+          </td>
           <td class="right">
             <form method="post" action="{{ url_for('form_delete', service=row.service) }}"
                   data-confirm="确认删除 {name}？" data-name="{{ row.service }}">
+              <input type="hidden" name="token" value="{{ row.token }}">
               <button class="danger" type="submit">删除</button>
             </form>
           </td>
@@ -44,13 +70,18 @@
       {% endfor %}
       </tbody>
     </table>
+    <p class="muted small">
+      每份编辑表单都带有一个针对该服务当前状态的令牌；若该服务在别处被修改、
+      删除后重建或从备份恢复，旧表单再提交会提示冲突并显示当前状态，不会写入。
+      其他服务的修改不影响它。
+    </p>
     {% else %}
     <p class="muted">目录为空。请在下方添加服务。</p>
     {% endif %}
   </section>
 
   <section class="card">
-    <h2>新增 / 修改服务</h2>
+    <h2>新增服务</h2>
     <form method="post" action="{{ url_for('form_upsert') }}" class="grid">
       <label>服务名
         <input name="service" required maxlength="128" placeholder="orders-api">
@@ -61,8 +92,12 @@
       <label>备注（可选）
         <input name="note" maxlength="200" placeholder="变更原因">
       </label>
-      <button type="submit">保存</button>
+      <button type="submit">新增</button>
     </form>
+    <p class="muted small">
+      此表单不带令牌，因此只用于新增；修改已有服务请使用上方目录中该服务的
+      编辑表单。
+    </p>
   </section>
 
   <section class="card">
